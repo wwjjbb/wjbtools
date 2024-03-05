@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+
+# ------------------------------------------------------------------------
+# splot
+#
+# This is based on genlop; its output is vaguely similar to running genlop
+# with -c, then -t for the same package. It doesn't attempt to guess the
+# build time, by default it shows the time the last 5 attempts took.
+# ------------------------------------------------------------------------
+#
+#    This program is free software; you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation; either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+# ------------------------------------------------------------------------
+
+import subprocess
+import os
+import re
+import sys
+import datetime
+import string
+from argparse import ArgumentParser
+
+LOGFILE = r"/var/log/emerge.log"
+
+def format_duration(secs):
+    """ Turn a time difference into a reasonable string
+    """
+    if secs<60:
+        mins = 0
+    else:
+        mins = int(secs/60)
+        secs -= (mins*60)
+    result = "%2d:%02d" % (mins,secs)
+    return result
+
+
+def escape_re(s):
+    """
+    Need to escape any characters in package name which are
+    valid re commands. So far, only come across "+", but
+    there are probably others out these.
+    e.g. gtk+ causes problems
+    """
+    result = re.escape(s)
+    return result
+
+def compare_package(desired,test,slashed):
+    """ Extract the package name by stripping the version
+        number of the package. Assumed to be "-[0-9]"
+        - desired: package name, may include category, but no version
+        - test: category/package-version
+    """
+    (testcat,testpkg) = test.split("/")
+    testname = re.split("-[0-9]",testpkg)[0]
+    if not slashed:
+        result = (desired==testname)
+    else:
+        (cat,pkg) = desired.split("/")
+        result = (pkg==testname)
+    return result
+
+
+def current_build():
+
+    """ Get a list of the currently running emerges, and output
+        their names, how long they've been building, and roughly
+        how much longer to go.
+    """
+
+    # This selects process information: pid and package
+    # The package version is ignored.
+    ebuild_re = re.compile(r"(\d+) \[(.+?)\-[0-9].*?\] .+")
+
+    # Nicked most of the following direct from genlop
+
+    cmd = "ps ax -o pid,args | tail -n +2 | sed -e's/^ *//' | grep ' sandbox ' | grep -v ' grep '"
+    result = subprocess.Popen(cmd,shell=True,stdin=subprocess.PIPE,stdout=subprocess.PIPE)
+    scanresults = result.communicate()[0].decode('utf-8').split('\n')
+
+    found = []
+    for line in scanresults:
+        check = ebuild_re.match(line)
+        if check:
+            the_pid = check.group(1)
+            the_ebuild = check.group(2)
+            found.append((the_pid,the_ebuild))
+    
+    if len(found) == 0:
+        print("Error: no working merge found.")
+        print(" (the -c option only works if there is an ongoing compilation)")
+        sys.exit(1)
+
+    for (pid,ebuild) in found:
+        generate_report(ebuild)
+
+
+def specified_package(ebuild):
+    """ Get the build times for the package
+    """
+    generate_report(ebuild,False)
+
+
+def generate_report(ebuild,show_current=True):
+    """ Find and print the durations for the given ebuild
+    """
+
+    slashed = (ebuild.find('/') >= 0)
+    
+    report = ""
+
+    sb = r"(\d+):  >>> emerge \((\d+) of (\d+)\) ([^ ]+) to \/"
+    start_build_re = re.compile(sb)
+
+    cb = r"(\d+):  ::: completed emerge \(\d+ of \d+\) ([^ ]+) to \/"
+    complete_build_re = re.compile(cb)
+
+    # print("START",sb)
+    # print("COMPL",cb)
+    e_count = 0
+    emlog = open(LOGFILE,'r')
+    for line in emlog.readlines():
+        look = start_build_re.match(line)
+        if look:
+            if compare_package(ebuild,look.group(4),slashed):            
+                e_start = int(look.group(1))
+                e_cur_num = look.group(2)
+                e_end_num = look.group(3)
+                e_current = look.group(4)
+        else:
+            look = complete_build_re.match(line)
+            if look:
+                if compare_package(ebuild,look.group(2),slashed):            
+                    e_end = int(look.group(1))
+                    e_end_time = datetime.datetime.fromtimestamp(e_end)
+                    e_count += 1
+                    report_line = "\t%s, %s, %s\n" % \
+                        (e_end_time.isoformat(' '),format_duration(e_end-e_start),e_current)
+                    report = report_line + report
+    emlog.close()
+        
+    # Only show up to 5 of the most recent build times. Can't
+    # see any point trying to use all the history and calc the
+    # expected time - no chance of getting it right, so just
+    # show the most recent set so user can work it out.
+    summary = report.split('\n')
+    summary = summary[0:options.limit]
+    report = '\n'.join(summary)
+
+    if show_current:
+        # Need to get the difference between e_start and now - that is how long
+        # the current ebuild has been going.
+        e_start_time = datetime.datetime.fromtimestamp(e_start)
+        runtime = datetime.datetime.now() - e_start_time
+
+        header = "\nCurrently merging %s out of %s:\n\n" % (e_cur_num,e_end_num)
+        header += ("\tEbuild: %s\n\tDuration: %s\n\n\tHistory:\n" % (e_current,format_duration(runtime.seconds)))
+    else:
+        e_current = r"n/a"
+        header = ("\n\tEbuild: %s\n\n\tHistory:\n" % e_current)
+    report = header + report
+    print(report)
+
+if __name__ == "__main__":
+    if not os.access(LOGFILE, os.R_OK):
+        print("Error: denied read access to the portage log file")
+        print("       are you logged in to the required account?")
+        sys.exit(1)
+        
+    showpkg = None
+    parser = ArgumentParser(description="List emerge times for current or specific package")
+    parser.add_argument('-t','--time',
+                        dest="showpkg",
+                        help="report the emerge times for the given  package")
+    parser.add_argument('-l','--limit',
+                        type=int,
+                        dest="limit",
+                        default=5,
+                        help="limit the number of build events listed")
+    options = parser.parse_args()
+
+    if options.showpkg:
+        specified_package(options.showpkg)
+    else:
+        current_build()
