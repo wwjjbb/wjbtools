@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+'''
+Read the package directory under /var/db/pkg - find the packages with
+the oldest build dates, and rebuild them.
+  - Allow the list of packages to be limited by number
+  - Allow the list of packages to be limited by date, i.e. nothing
+    newer than the given date.
+  - Able to select pump mode for use with distcc
+  - Ignore certain packages, e.g. there's not a lot of point in
+    remerging sys-kernel/gentoo-sources
+  - Ignore version numbers - sometimes find that old dependency
+    versions are still installed long after they have been removed
+    from portage. This is a way to ignore the installed versions
+    and build the current versions.
+  - Ignore certain packages in pump mode - there used to be some
+    packages that were troublesome when being built via distcc.
+    This allows them to be skipped.
+  - Provide "ask" and "pretend" options.
+
+@author: wjb
+'''
+
+import os
+import os.path
+import sys
+from glob import glob
+from datetime import datetime, timedelta
+from argparse import ArgumentParser
+from xml.dom.minidom import parse, getDOMImplementation
+
+# The default number of packages to rebuild
+DEFAULT_PACKAGE_COUNT = 50
+
+CONFIG_DIR = os.path.expanduser(r"~/.config")
+CONFIG_FILE = os.path.join(CONFIG_DIR,"portage-rebuild")
+
+
+class Config:
+
+    def __init__(self):
+        self.pkgnames = set()
+        self.localonlypkgnames = set()
+        self.changed = False
+        self.pumpmode = False
+
+    def load(self):
+
+        """
+        Read the configuration file. Extract the list of
+        packages to be ignored.
+        """
+        self.pkgnames = set()
+
+        if os.path.exists(CONFIG_FILE):
+
+            cfg = parse(CONFIG_FILE)
+
+            pms = cfg.getElementsByTagName("pump")
+            for pm in pms:
+                opt = pm.getAttribute("on")
+                if opt=="true":
+                    self.pumpmode = True
+                elif opt=="false":
+                    self.pumpmode = False
+
+            igs = cfg.getElementsByTagName("ignore")
+            for ig in igs:
+                package = ig.getAttribute("package")
+                self.pkgnames.add(package)
+            self.changed = False
+
+            localonlys = cfg.getElementsByTagName("localonly")
+            for local in localonlys:
+                package = local.getAttribute("package")
+                self.localonlypkgnames.add(package)
+            self.changed = False
+
+    def flush(self):
+        """
+        Save the configuration file if anything has changed
+        """
+        if self.changed:
+            self.changed = False
+            impl = getDOMImplementation()
+            newdoc = impl.createDocument(None,"portagerebuild",None)
+            outer = newdoc.documentElement
+            outer.setAttribute("version","1.0")
+
+            item = newdoc.createElement("pump")
+            if self.pumpmode:
+                item.setAttribute("on","true")
+            else:
+                item.setAttribute("on","false")
+            outer.appendChild(item)
+
+            for p in self.pkgnames:
+                item = newdoc.createElement("ignore")
+                item.setAttribute("package",p)
+                outer.appendChild(item)
+
+            for p in self.localonlypkgnames:
+                item = newdoc.createElement("localonly")
+                item.setAttribute("package",p)
+                outer.appendChild(item)
+
+            if not os.path.exists(CONFIG_DIR):
+                os.makedirs(CONFIG_DIR)
+            xml = open(CONFIG_FILE,"w")
+            xml.write(newdoc.toprettyxml())
+            xml.close()
+
+
+    def showList(self):
+
+        print("Pump:", end=' ')
+        if self.pumpmode:
+            print("on")
+        else:
+            print("off")
+
+        result = []
+        for p in self.pkgnames:
+            result += [p]
+        result.sort()
+
+        print("Ignored packages:")
+        for p in result:
+            print("   ",p)
+
+        result = []
+        for p in self.localonlypkgnames:
+            result += [p]
+        result.sort()
+        if len(result) > 0:
+            print("Local only packages:")
+            for p in result:
+                print("   ",p)
+
+    def ignored(self,pkgname):
+        """
+        pkgname is <category>/<name>
+        returns true if the pkgname is in the list to be ignored
+        """
+        return ((pkgname in self.pkgnames) or
+                (self.pumpmode and pkgname in self.localonlypkgnames))
+
+    def add(self,pkgname):
+        if pkgname not in self.pkgnames:
+            self.pkgnames.add(pkgname)
+            self.changed = True
+
+    def addlocal(self,pkgname):
+        """ Add this package to list of those to be ignored in pump mode """
+        if pkgname not in self.localonlypkgnames:
+            self.localonlypkgnames.add(pkgname)
+            self.changed = True
+
+    def remove(self,pkgname):
+        if pkgname in self.pkgnames:
+            self.pkgnames.remove(pkgname)
+            self.changed = True
+        if pkgname in self.localonlypkgnames:
+            self.localonlypkgnames.remove(pkgname)
+            self.changed = True
+
+    def setpump(self,value):
+        if value != self.pumpmode:
+            self.changed = True
+            self.pumpmode = value
+
+def is_version(s):
+    """
+    Looks at the given string and decides whether it is a valid version
+    number or not. The syntax is too demented for a regular expression.
+
+    from: https://devmanual.gentoo.org/ebuild-writing/file-format/
+    """
+    idx = 0
+    types = ('alpha','beta','pre','rc','p')
+
+    if not s[idx].isdigit():
+        return False
+
+    while s[idx].isdigit():
+        idx += 1
+        if idx >= len(s):
+            return True
+
+    while s[idx] == '.':
+        idx += 1
+        if idx >= len(s):
+            return False
+        if not s[idx].isdigit():
+            return False
+        while s[idx].isdigit():
+            idx += 1
+            if idx >= len(s):
+                return True
+
+    if s[idx]>='a' and s[idx]<='z':
+        idx += 1
+        if idx >= len(s):
+            return True
+
+    if idx >= len(s):
+        return True
+
+    while idx<len(s) and s[idx] == '_':
+        idx += 1
+        if idx >= len(s):
+            return False
+        typ = ''
+        while idx<len(s) and s[idx]>='a' and s[idx]<='z':
+            typ += s[idx]
+            idx += 1
+        if typ not in types:
+            return False
+        if idx >= len(s):
+            return True
+        num = ''
+        while idx<len(s) and s[idx].isdigit():
+            num += s[idx]
+            idx += 1
+
+    if idx >= len(s):
+        return True
+
+    if s[idx] != '-':
+        return False
+
+    idx += 1
+    if idx >= len(s):
+        return False
+
+    if s[idx] != 'r':
+        return False
+
+    idx += 1
+    if idx >= len(s):
+        return True
+
+    num = ''
+    while idx<len(s) and s[idx].isdigit():
+        num += s[idx]
+        idx += 1
+    if idx >= len(s):
+        return True
+
+    return False
+
+
+
+def splitname(package):
+    """
+    Given: category/name-123
+    Return a tuple: (<category>, <name>, <version>)
+    """
+
+    (category,name) = package.split('/')
+
+    dashes = [i for i,ltr in enumerate(name) if ltr=='-']
+
+    package_name = None
+    package_version = None
+
+    for pos in dashes:
+        if is_version(name[pos+1:]):
+            package_name = name[:pos]
+            package_version = name[pos+1:]
+            break
+
+    return (category, package_name, package_version)
+
+
+
+class PackageDef:
+
+    def __init__(self,numstamp,textstamp,package,slot):
+        """
+        package is: category/packagename-version
+        """
+        self.numericstamp = numstamp
+        self.timestamp = textstamp
+        self.slot = slot
+
+        (cat,name,ver) = splitname(package)
+        self.category = cat
+        self.name = name
+        self.version = ver
+
+    @property
+    def fullname(self):
+        return self.category + '/' + self.name
+
+    @property
+    def fullnamever(self):
+        return self.category + '/' + self.name + '-' + self.version
+
+
+def get_args():
+    parser = ArgumentParser(description="Rebuild the oldest installed packages")
+
+    parser.add_argument('-c','--count',
+                        type=int,
+                        dest="count",
+                        default=0,
+                        help="The number of packages to find and build, default {0}.".format(DEFAULT_PACKAGE_COUNT))
+
+    parser.add_argument('-a','--ask',
+                        action="store_true",
+                        dest="ask",
+                        default=False,
+                        help="Whether to do emerge --ask")
+
+    parser.add_argument('-p','--pretend',
+                        action="store_true",
+                        dest="pretend",
+                        default=False,
+                        help="Do not run emerge, just list what would be merged.")
+
+    parser.add_argument('-m','--months',
+                        type=int,
+                        dest="age",
+                        default=-1,
+                        help="Build packages which are this age (months) or older")
+
+    parser.add_argument('-A','--add',
+                        action="append",
+                        dest="addpackages",
+                        default=[],
+                        help="Package name to add to the ignored list. May be repeated.")
+
+    parser.add_argument('--local',
+                        action="append",
+                        dest="localpackages",
+                        default=[],
+                        help="Package name to add to the local ignore list. These packages are not rebuilt while in pump mode - usually want to specify packages which do not build successfully in pump mode. May be repeated.")
+
+    parser.add_argument('-R','--remove',
+                        action="append",
+                        dest="delpackages",
+                        default=[],
+                        help="Package name to delete from the ignored list. May be repeated.")
+
+    parser.add_argument('-s','--strip-versions',
+                        action="store_true",
+                        dest="stripversions",
+                        help="Strip version numbers, i.e. ignore the version numbers of the installed packages and just build the current ones. For those rare occasions when portage thinks an obsolete version of a package will do.")
+
+    parser.add_argument('-L','--list',
+                        action="store_true",
+                        dest="listpkg",
+                        help="List the ignored packages")
+
+    parser.add_argument('-P','--pump',
+                        action="store_true",
+                        dest="pumpmode",
+                        default=config.pumpmode,
+                        help="Compile in pump mode from now. Should be enabled on distcc clients.")
+
+    parser.add_argument('-N','--normal',
+                        action="store_false",
+                        dest="pumpmode",
+                        help="Compile in normal mode from now, i.e. not pump mode. If this PC is not a distcc client.")
+
+    return parser.parse_args()
+
+
+if __name__ == '__main__':
+
+    config = Config()
+    config.load()
+
+
+    # Parse the command line options
+    args = get_args()
+
+    config.setpump(args.pumpmode)
+
+    for adds in args.addpackages:
+        config.add(adds)
+
+    for adds in args.localpackages:
+        config.addlocal(adds)
+
+    for rems in args.delpackages:
+        config.remove(rems)
+
+    if args.listpkg or config.changed:
+        # Asking for listing or changing config terminates here
+        config.showList()
+        config.flush()
+        sys.exit(0)
+
+    # Deal with interactions between the parameter values:
+    # - if an age has been specified but no package count, then emerge
+    #   all packages up to the given age.
+    # - if there is an age and a package count, apply them both.
+    # - if there is no age and no package count, apply the default
+    #   package count
+
+    today = datetime.today()
+    if args.age >= 0:
+        limitdate = today - timedelta(args.age*30)
+        if args.count == 0:
+            # In this context means there is no limit
+            args.count = None
+    else:
+        limitdate = None
+        if args.count == 0:
+            args.count = DEFAULT_PACKAGE_COUNT
+
+    # Now find the packages ...
+
+    rootpath = r"/var/db/pkg"
+    packagelist = {}
+
+    filelist = glob(r"/var/db/pkg/*/*/CONTENTS")
+
+    for fname in filelist:
+        split = fname.split(r'/')
+        category = split[-3]
+        package = split[-2]  # includes the version number
+
+        buildtime_name = os.path.join(rootpath,category,package,"BUILD_TIME")
+        if os.path.exists(buildtime_name):
+            with open(buildtime_name,"r") as fh:
+                btm = fh.readline().strip()
+        else:
+            btm = "1"
+
+        slot_name = os.path.join(rootpath,category,package,"SLOT")
+        if os.path.exists(slot_name):
+            with open(slot_name,"r") as fh:
+                slot = fh.readline().strip()
+                slot = slot.split('/')[0]
+        else:
+            slot = "0"
+
+        numericstamp = float(btm)
+        timestamp = datetime.fromtimestamp(numericstamp)
+
+        if not limitdate or (timestamp<=limitdate):
+            item = PackageDef(numericstamp,
+                              timestamp.isoformat(' '),
+                              category + '/' + package,
+                              slot)
+            packagelist[item.timestamp] = item
+
+    thetimes = list(packagelist.keys())
+    thetimes.sort()
+
+    command = "emerge --quiet --quiet-build"
+    if args.ask:
+        command += " --ask"
+    command += " --oneshot"
+
+    if config.pumpmode:
+        command = "pump " + command
+
+    counter = 0
+    for item in thetimes:
+        pkg = packagelist[item]
+
+        if not config.ignored(pkg.fullname):
+            if args.stripversions:
+                print("{0} {1} ({2})".format(pkg.timestamp,pkg.fullname,pkg.version))
+                command += " {0}:{1}".format(pkg.fullname,pkg.slot)
+            else:
+                print("{0} {1}".format(pkg.timestamp,pkg.fullnamever))
+                command += " ={0}".format(pkg.fullnamever)
+            counter+=1
+            if not args.count:
+                continue
+            if counter >= args.count:
+                break
+        else:
+            print(">>>> Ignored: {0}".format(pkg.fullnamever))
+
+    print()
+    print(command)
+
+    # Run the emerge command if it has been selected
+    if not args.pretend:
+        command_args = command.split(' ')
+        os.execvp(command_args[0], command_args)
+
+
