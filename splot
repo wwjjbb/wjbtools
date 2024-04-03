@@ -71,9 +71,10 @@ def compare_package(desired,test,slashed):
 
 def current_build():
 
-    """ Get a list of the currently running emerges, and output
-        their names, how long they've been building, and roughly
-        how much longer to go.
+    """
+    Get a list of the currently running emerges, and output
+    their names, how long they've been building, and roughly
+    how much longer to go.
     """
 
     # This selects process information: pid and package
@@ -104,13 +105,15 @@ def current_build():
 
 
 def specified_package(ebuild):
-    """ Get the build times for the package
+    """
+    Get the build times for the package
     """
     generate_report(ebuild,False)
 
 
 def generate_report(ebuild,show_current=True):
-    """ Find and print the durations for the given ebuild
+    """
+    Find and print the durations for the given ebuild
     """
 
     slashed = (ebuild.find('/') >= 0)
@@ -172,6 +175,7 @@ def generate_report(ebuild,show_current=True):
 
 def show_remaining_builds():
     """
+    List the packages queued to build, including the current build task.
     """
     if 'resume' in portage.mtimedb and 'mergelist' in portage.mtimedb['resume']:
         plist = []
@@ -183,11 +187,18 @@ def show_remaining_builds():
     else:
         print("No builds in progress")
 
-if __name__ == "__main__":
+
+def check_log_access():
+    """
+    Check user has read access to the portage log file
+    """
     if not os.access(LOGFILE, os.R_OK):
         print("Error: denied read access to the portage log file")
         print("       are you logged in to the required account?")
         sys.exit(1)
+
+
+if __name__ == "__main__":
 
     showpkg = None
     parser = ArgumentParser(description="List emerge times for current or specific package")
@@ -207,8 +218,10 @@ if __name__ == "__main__":
     options = parser.parse_args()
 
     if options.showpkg:
+        check_log_access()
         specified_package(options.showpkg)
     elif options.running:
         show_remaining_builds()
     else:
+        check_log_access()
         current_build()
