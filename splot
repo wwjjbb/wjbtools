@@ -26,6 +26,7 @@ import re
 import sys
 import datetime
 import string
+import portage
 from argparse import ArgumentParser
 
 LOGFILE = r"/var/log/emerge.log"
@@ -92,7 +93,7 @@ def current_build():
             the_pid = check.group(1)
             the_ebuild = check.group(2)
             found.append((the_pid,the_ebuild))
-    
+
     if len(found) == 0:
         print("Error: no working merge found.")
         print(" (the -c option only works if there is an ongoing compilation)")
@@ -113,7 +114,7 @@ def generate_report(ebuild,show_current=True):
     """
 
     slashed = (ebuild.find('/') >= 0)
-    
+
     report = ""
 
     sb = r"(\d+):  >>> emerge \((\d+) of (\d+)\) ([^ ]+) to \/"
@@ -129,7 +130,7 @@ def generate_report(ebuild,show_current=True):
     for line in emlog.readlines():
         look = start_build_re.match(line)
         if look:
-            if compare_package(ebuild,look.group(4),slashed):            
+            if compare_package(ebuild,look.group(4),slashed):
                 e_start = int(look.group(1))
                 e_cur_num = look.group(2)
                 e_end_num = look.group(3)
@@ -137,7 +138,7 @@ def generate_report(ebuild,show_current=True):
         else:
             look = complete_build_re.match(line)
             if look:
-                if compare_package(ebuild,look.group(2),slashed):            
+                if compare_package(ebuild,look.group(2),slashed):
                     e_end = int(look.group(1))
                     e_end_time = datetime.datetime.fromtimestamp(e_end)
                     e_count += 1
@@ -145,7 +146,7 @@ def generate_report(ebuild,show_current=True):
                         (e_end_time.isoformat(' '),format_duration(e_end-e_start),e_current)
                     report = report_line + report
     emlog.close()
-        
+
     # Only show up to 5 of the most recent build times. Can't
     # see any point trying to use all the history and calc the
     # expected time - no chance of getting it right, so just
@@ -168,12 +169,26 @@ def generate_report(ebuild,show_current=True):
     report = header + report
     print(report)
 
+
+def show_remaining_builds():
+    """
+    """
+    if 'resume' in portage.mtimedb and 'mergelist' in portage.mtimedb['resume']:
+        plist = []
+        todo = portage.mtimedb['resume']['mergelist']
+        for item in todo:
+            package = item[2]
+            print(f"={package}")
+
+    else:
+        print("No builds in progress")
+
 if __name__ == "__main__":
     if not os.access(LOGFILE, os.R_OK):
         print("Error: denied read access to the portage log file")
         print("       are you logged in to the required account?")
         sys.exit(1)
-        
+
     showpkg = None
     parser = ArgumentParser(description="List emerge times for current or specific package")
     parser.add_argument('-t','--time',
@@ -183,10 +198,17 @@ if __name__ == "__main__":
                         type=int,
                         dest="limit",
                         default=5,
-                        help="limit the number of build events listed")
+                        help="limit the number of events to be listed")
+    parser.add_argument('-r','--remaining',
+                        action='store_true',
+                        dest="running",
+                        default=False,
+                        help="Show the list of remaining builds")
     options = parser.parse_args()
 
     if options.showpkg:
         specified_package(options.showpkg)
+    elif options.running:
+        show_remaining_builds()
     else:
         current_build()
